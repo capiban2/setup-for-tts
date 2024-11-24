@@ -1,0 +1,6 @@
+consumer/.venv
+
+sound_service/node_modules
+
+sound_service/package-lock.json
+

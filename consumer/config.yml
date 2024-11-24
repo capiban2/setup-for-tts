@@ -1,0 +1,7 @@
+services:
+  rabbit:
+    host: 'rabbit'
+    port: 5672
+  sound_service:
+    host: 'sound_service'
+    port: 3456
