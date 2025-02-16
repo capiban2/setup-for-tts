@@ -1,0 +1,13 @@
+services:
+  rabbit:
+    host: rabbit
+    port: 5672
+    queue_name: acall_queue
+  sound_service:
+    host: sound_service
+    port: 6667
+  teratts_service:
+    host: teratts_service
+    port: 6668
+
+stack_name: acall_stack
