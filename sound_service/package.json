@@ -9,6 +9,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "get-audio-duration": "^4.0.1",
     "ws": "^8.18.0"
   }
 }
