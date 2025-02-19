@@ -2,26 +2,104 @@ const ws = require("ws");
 const fs = require("fs");
 const config = require("/js_config").config;
 var get_audio_duration = require("get-audio-duration");
+import { Trie } from "./trie.js";
 
+// HINT: these particular constants have been choosen that
+// it would be sufficient to store 10000*5*5 files that is the
+// amount of files in the critical case
+let first_layer_count = process.env.FIRST_LAYER_COUNT === undefined
+  ? 5
+  : parseInt(process.env.FIRST_LAYER_COUNT),
+  second_layer_count = process.env.SECOND_LAYER_COUNT === undefined
+    ? 5
+    : parseInt(process.env.SECOND_LAYER_COUNT);
+
+let maximum_in_directory = process.env.MAXIMUM_IN_DIRECTORY === undefined
+  ? 10000
+  : parseInt(process.env.MAXIMUM_IN_DIRECTORY);
 const wss = new ws.WebSocketServer({ port: config.ws_server.port });
 const audio_store_path = config.storage_path;
+let storage_state = [];
+let storage_tries = [];
+
+function generate_storage_hierarchy() {
+  console.log("Generation of the heirarchy has been started");
+  let root = config.storage_path;
+  for (let t_ = 0; t_ != first_layer_count; ++t_) {
+    for (let j_ = 0; j_ != second_layer_count; ++j_) {
+      let cur_dir_name = `${root}/${t_ + 1}/${j_ + 1}`;
+      fs.access(cur_dir_name, (not_exists) => {
+        if (not_exists) {
+          fs.mkdir(cur_dir_name, { recursive: true }, (err) => {
+            if (err) throw err;
+          });
+        }
+      });
+    }
+  }
+  console.log("All necessary dirs have been created(probably).");
+}
+
+function init_storage_state() {
+  console.log("Initalization of the hierarchy state has been started");
+  let root = config.storage_path;
+  for (let t_ = 0; t_ != first_layer_count; ++t_) {
+    for (let j_ = 0; j_ != second_layer_count; ++j_) {
+      let cur_dir_name = `${root}/${t_ + 1}/${j_ + 1}`;
+      storage_state[cur_dir_name] = 0;
+      storage_tries[cur_dir_name] = new Trie();
+    }
+  }
+}
+
+function find_out_storage(token) {
+  for (let t_ = 0; t_ != first_layer_count; ++t_) {
+    for (let j_ = 0; j_ != second_layer_count; ++j_) {
+      let cur_dir_name = `${root}/${t_ + 1}/${j_ + 1}`;
+      if (storage_tries[cur_dir_name].constains(token)) {
+        return cur_dir_name;
+      }
+    }
+  }
+}
 
 function delete_case(token) {
-  fs.unlink(`${audio_store_path}/${token}.wav`, (err) => {
+  let audio_dir = find_out_storage(token);
+  fs.unlink(`${audio_dir}/${token}.wav`, (err) => {
     if (err) console.log(err);
+    else {
+      console.log(
+        `Audio-file with [${token}] uuid has been deleted succesfully.`,
+      );
+    }
   });
 }
 
 async function store_case(token, data) {
+  let root = config.storage_path;
   try {
-    fs.writeFile(`${audio_store_path}/${token}.wav`, data, (err) => {
-      if (err) {
-        console.log("Error occured");
-        console.log(err);
-      } else {
-        console.log(`Audio with  token [${token}] was stored succesfully`);
+    for (let t_ = 0; t_ != first_layer_count; ++t_) {
+      for (let j_ = 0; j_ != second_layer_count; ++j_) {
+        let cur_dir_name = `${root}/${t_ + 1}/${j_ + 1}`;
+        if (storage_state[cur_dir_name] >= maximum_in_directory) {
+          continue;
+        }
+        fs.writeFile(`${cur_dir_name}/${token}.wav`, data, (err) => {
+          if (err) {
+            console.log(
+              "Error occured with storing audio-file with [${token}] uuid.",
+            );
+            console.log(err);
+          } else {
+            storage_tries[cur_dir_name].insert(token);
+            storage_state[cur_dir_name]++;
+            console.log(
+              `Audio-file with uuid [${token}] has been stored succesfully.`,
+            );
+          }
+        });
       }
-    });
+    }
   } catch (err) {
     console.log(`Error with file openning [${err}].`);
   }
@@ -29,7 +107,8 @@ async function store_case(token, data) {
 
 async function get_case(ws, token) {
   try {
-    const content = fs.readFileSync(`${audio_store_path}/${token}.wav`);
+    let audio_dir = find_out_storage(token);
+    const content = fs.readFileSync(`${audio_dir}/${token}.wav`);
     console.log(
       `There is file ${content.length == 0 ? "but" : "and"} its ${content.length != 0 ? "not" : ""
       } empty`,
@@ -48,8 +127,9 @@ async function healthcheck(ws) {
 }
 async function find_file_duration(ws, audio_uuid) {
   try {
+    let audio_dir = find_out_storage(audio_uuid);
     get_audio_duration.getAudioDurationInSeconds(
-      `${audio_store_path}/${audio_uuid}.wav`,
+      `${audio_dir}/${audio_uuid}.wav`,
     ).then((dur) => {
       ws.send(dur);
     });
@@ -58,7 +138,6 @@ async function find_file_duration(ws, audio_uuid) {
     ws.send(0);
   }
 }
-console.log("Start serving!");
 wss.on("connection", function connection(ws) {
   console.log("Got connection!");
   ws.on("error", console.error);
@@ -100,3 +179,7 @@ wss.on("connection", function connection(ws) {
     }
   });
 });
+
+generate_storage_hierarchy();
+init_storage_state();
+console.log("Start serving!");
