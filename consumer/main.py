@@ -48,13 +48,12 @@ async def callback(
     method,
     properties,
     body,
-    ss_conn,
     very_start_ts,
-    stack_name,
+    config,
 ):
-    message = json.loads(body.decode())
-    purpose = message["purpose"]
-    payload = message["payload"]
+    payload = json.loads(body.decode())
+    print(f"Got new message : {payload}")
+
     """
     payload has foll. structure :
     {
@@ -77,10 +76,10 @@ async def callback(
         out_ch_data[0].basic_publish(
             exchange="",
             routing_key=out_ch_data[1],
-            body=json.dumps(payload),
+            body=json.dumps({"uuid": ""}),
             properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
         )
-        print("Got closing packet. Dying...")
+        print("Got closing packet. Resent it to awaiter. Dying...")
         return False
     # TTS PART HERE
     #
@@ -102,12 +101,11 @@ async def callback(
         tts_port = body["port"]
         print(f"Got {body} from tts queue")
         break
-    tts_conn = await get_tts_conn(f"{stack_name}_{tts_host}", tts_port)
+    tts_conn = await get_tts_conn(f"{config['stack_name']}_{tts_host}", tts_port)
     if tts_conn is None:
-        print("Cannot be attached to tts. Leaving...")
+        print("Couldn't attach to tts. Leaving...")
         return
     try:
-        print(json.dumps(payload, ensure_ascii=False))
         await tts_conn.send(
             json.dumps(payload, ensure_ascii=False).encode("utf8"), text=True
         )
@@ -126,7 +124,19 @@ async def callback(
     msg = "STR".encode() + len(payload["token"]).to_bytes(1) + payload["token"].encode()
     msg += wav_data
     start = time.perf_counter()
-    await ss_conn.send(message=msg, text=False)
+    ss_conn = None
+    for _ in range(5):
+        ss_conn = await get_sound_service_conn(config)
+        if ss_conn is not None:
+            break
+    if ss_conn is None:
+        print("Couldnt get a sound_service connection. Leaving!")
+        return False
+    try:
+        await ss_conn.send(message=msg, text=False)
+    except websockets.ConnectionClosedOK as e:
+        print(f"Error while sending to sound_service : {e}")
+        return False
     print(f"Sent to sound_service in {time.perf_counter()-start}s")
 
     start = time.perf_counter()
@@ -139,11 +149,15 @@ async def callback(
     print(f"Sent to audio_awaiter in {time.perf_counter()-start}s")
 
     print(
-        f"Done {payload['seq']}/{payload['total']} and time passed : {datetime.now() - very_start_ts}"
+        f"Done {int(payload['seq'])  + 1}/{payload['total']} and time passed : {datetime.now() - very_start_ts}"
     )
 
     print("Releasing tts connection...")
-    await tts_conn.close()
+    try:
+        await tts_conn.close()
+    except RuntimeError:
+        print("Exception catched while closing tts connection")
+        return False
     print("TTS connection has released")
     return True
 
@@ -289,6 +303,7 @@ async def main():
     out_channel.queue_declare(queue=out_queue_name, durable=True)
 
     tts_channel.queue_declare(queue=tts_queue_name, durable=True)
+    tts_channel.basic_qos(prefetch_count=1)
 
     death_channel.queue_declare(queue=death_ack_queue_name, durable=True)
     death_channel.queue_declare(queue=death_req_queue_name, durable=True)
@@ -310,23 +325,22 @@ async def main():
             method,
             properties,
             body,
-            sound_service_connection,
             very_start,
-            config["stack_name"],
+            config,
         )
         if not carry_on:
             break
-        if check_postbox_for_death_letter(
+        if await check_postbox_for_death_letter(
             (death_channel, death_req_queue_name, death_ack_queue_name),
             (tts_channel, tts_queue_name),
             config["stack_name"],
         ):
             break
-
     requeued_mess = in_channel.cancel()
     death_channel.cancel()
     print(f"Requeued messages : {requeued_mess}")
     in_channel.close()
+
     out_channel.close()
     tts_channel.close()
     death_channel.close()
