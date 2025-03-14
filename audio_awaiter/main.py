@@ -50,12 +50,13 @@ def get_config():
 def send_ids(ids, cfg, rdis_clt):
     host = cfg["host"]
     port = cfg["port"]
-    jwt = get_node_token(host, port, rdis_clt)
-    if jwt is None:
-        return None, None, False
+    # jwt = get_node_token(host, port, rdis_clt)
+    # if jwt is None:
+    #    print("Couldn't get jwt from node!")
+    #    return None, None, False
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {jwt}",
+        #    "Authorization": f"Bearer {jwt}",
     }
 
     route = cfg["routes"]["update_audio_readiness"]
@@ -68,29 +69,39 @@ def send_ids(ids, cfg, rdis_clt):
 
 def send_wrapper(ids, redis_clt, cfg):
     code, text, __rslt = send_ids(ids, cfg["node"], redis_clt)
-    print(f"Response : {text}")
+    print(f"Payload : {text}, status_code : {code}")
     if not __rslt or (code is not None and code > 201):
         return False
     return True
 
 
-def callback(ch, method, properties, body, cfg, ids_holder: list, redis_clt):
+def callback(
+    ch, method, properties, body, cfg, ids_holder: list, redis_clt, dead_consumers_count
+):
     data_count_border = cfg["data_amount_border"]
 
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
     payload = json.loads(body.decode())
-    print(f"Got new uuid to update : [{payload['uuid']}]")
-    if payload["uuid"] == "":
+    if payload["uuid"] != "":
+        print(f"Got new uuid to update : [{payload['uuid']}]")
+    else:
+        print(
+            f"Got dead packet from one of the consumers. Already dead : {dead_consumers_count+1},"
+            f"still alive : {int(os.environ['CONSUMERS_COUNT']) - dead_consumers_count -1}"
+        )
+        if dead_consumers_count != int(os.environ["CONSUMERS_COUNT"]) - 1:
+            return True, True
+
         send_wrapper(ids_holder, redis_clt, cfg)
         print("Got closing packet. Dying...")
-        return False
+        return False, True
     ids_holder.append(payload["uuid"])
     if len(ids_holder) < data_count_border:
-        return True
+        return True, False
     rslt = send_wrapper(ids_holder, redis_clt, cfg)
-    ids_holder = []
-    return rslt
+    ids_holder.clear()
+    return rslt, False
 
 
 async def get_conn_rabbit(cfg):
@@ -155,6 +166,11 @@ def construct_helper_cfg():
 
 async def main():
     print("Starting awaiting!")
+
+    if "CONSUMERS_COUNT" not in os.environ:
+        raise RuntimeError("Consumers count wasnt provided in env variables!")
+
+    dead_consumers_count = 0
     config = construct_helper_cfg()
     if config is None:
         return
@@ -175,13 +191,21 @@ async def main():
     channel.basic_qos(prefetch_count=1)
 
     ids_holder = []
-
     for method, properties, body in channel.consume(queue=queue_name):
-        carry_on = callback(
-            channel, method, properties, body, config, ids_holder, redis_clt
+        carry_on, got_dead_letter = callback(
+            channel,
+            method,
+            properties,
+            body,
+            config,
+            ids_holder,
+            redis_clt,
+            dead_consumers_count,
         )
         if not carry_on:
             break
+        if got_dead_letter:
+            dead_consumers_count += 1
 
     requeued_mess = channel.cancel()
     print(f"Requeued messages : {requeued_mess}")
