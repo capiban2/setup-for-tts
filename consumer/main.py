@@ -124,12 +124,8 @@ async def callback(
     msg = "STR".encode() + len(payload["token"]).to_bytes(1) + payload["token"].encode()
     msg += wav_data
     start = time.perf_counter()
-    ss_conn = None
-    for _ in range(5):
-        ss_conn = await get_sound_service_conn(config)
-        if ss_conn is not None:
-            break
-    if ss_conn is None:
+
+    if (ss_conn := await get_sound_service_conn(config)) is None:
         print("Couldnt get a sound_service connection. Leaving!")
         return False
     try:
@@ -159,6 +155,13 @@ async def callback(
         print("Exception catched while closing tts connection")
         return False
     print("TTS connection has released")
+    print("Releasing ss connection...")
+    try:
+        await ss_conn.close()
+    except RuntimeError:
+        print("Exception catched while closing ss connection")
+        return False
+    print("SS connection has released")
     return True
 
 
@@ -269,11 +272,6 @@ async def main():
         return
     start = time.perf_counter()
 
-    sound_service_connection = await get_sound_service_conn(config)
-    if sound_service_connection is None:
-        print("Cannot connect to sound service. Comitting suicide...")
-        sys.exit(1)
-
     # tts_connection = await get_tts_conn(config)
     # if tts_connection is None:
     #     print("Cannot connect to tts_service. Comitting suicide...")
@@ -345,7 +343,6 @@ async def main():
     tts_channel.close()
     death_channel.close()
     connection.close()
-    await sound_service_connection.close()
     print(f"Spent {time.perf_counter() - start}s at all!")
 
 
