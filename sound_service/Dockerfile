@@ -1,6 +1,6 @@
 FROM node:22-alpine
 
-COPY index.js trie.js package.json healthcheck.js /
+COPY index.js trie.js js_config.js package.json healthcheck.js /
 
 RUN npm install
 
