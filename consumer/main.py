@@ -6,6 +6,7 @@ import json
 import yaml
 import asyncio
 import websockets
+import requests
 from datetime import datetime
 import os
 import time
@@ -26,7 +27,7 @@ async def get_tts_conn(host, port):
             print("Got connection to tts!")
             return conn
         except Exception as e:
-            print(f"Catched exception while connection to sound_service : {e}")
+            print(f"Catched exception while connection to tts_service : {e}")
             await asyncio.sleep(10)
 
     return None
@@ -88,6 +89,7 @@ async def callback(
     print("Waiting for free tts host.")
 
     tts_host, tts_port = None, None
+
     while True:
         method_frame, _, flat_body = tts_ch_data[0].basic_get(queue=tts_ch_data[1])
         print(method_frame, _, flat_body)
@@ -121,19 +123,26 @@ async def callback(
         return False
     print(f"Task consumed {time.perf_counter() - start}s")
 
-    msg = "STR".encode() + len(payload["token"]).to_bytes(1) + payload["token"].encode()
-    msg += wav_data
     start = time.perf_counter()
 
-    if (ss_conn := await get_sound_service_conn(config)) is None:
-        print("Couldnt get a sound_service connection. Leaving!")
-        return False
-    try:
-        await ss_conn.send(message=msg, text=False)
-    except websockets.ConnectionClosedOK as e:
-        print(f"Error while sending to sound_service : {e}")
-        return False
-    print(f"Sent to sound_service in {time.perf_counter()-start}s")
+    resp = requests.put(
+        f'http://{config["stack_name"]}_{config["services"]["sound_service"]["docker_host"]}:{config["services"]["sound_service"]["port"]}/audio/{payload["token"]}',
+        wav_data,
+    )
+
+    print(
+        f"Sent to sound_service in {time.perf_counter()-start}s, and status_code {resp.status_code}"
+    )
+    if not resp.ok:
+        print(
+            "Something went wrong with sound_service, terminate process with 0 status so docker wont restart it"
+        )
+        try:
+            await tts_conn.close()
+        except RuntimeError:
+            print("Exception catched while closing tts connection")
+
+        sys.exit(0)
 
     start = time.perf_counter()
     out_ch_data[0].basic_publish(
@@ -142,6 +151,7 @@ async def callback(
         body=json.dumps({"uuid": payload["token"]}),
         properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
     )
+
     print(f"Sent to audio_awaiter in {time.perf_counter()-start}s")
 
     print(
@@ -155,13 +165,6 @@ async def callback(
         print("Exception catched while closing tts connection")
         return False
     print("TTS connection has released")
-    print("Releasing ss connection...")
-    try:
-        await ss_conn.close()
-    except RuntimeError:
-        print("Exception catched while closing ss connection")
-        return False
-    print("SS connection has released")
     return True
 
 
