@@ -97,66 +97,98 @@ async def callback(
             print("Still waiting...")
             await asyncio.sleep(1)
             continue
-        tts_ch_data[0].basic_ack(delivery_tag=method_frame.delivery_tag)
+        # FIX: ack used to happen right here, before any of the work below —
+        # any failure between this point and a real completion silently
+        # dropped a live, free teratts instance out of the pool forever
+        # (nothing else re-announces it). Ack moved to the end of a
+        # successful run; every failure path below nacks with requeue
+        # instead, so the announcement — and the instance — comes back.
         body = json.loads(flat_body.decode())
         tts_host = body["host"]
         tts_port = body["port"]
         print(f"Got {body} from tts queue")
         break
+
+    def _return_announcement():
+        tts_ch_data[0].basic_nack(delivery_tag=method_frame.delivery_tag, requeue=True)
+
     tts_conn = await get_tts_conn(f"{config['stack_name']}_{tts_host}", tts_port)
     if tts_conn is None:
         print("Couldn't attach to tts. Leaving...")
-        return
+        _return_announcement()
+        return True
+
     try:
-        await tts_conn.send(
-            json.dumps(payload, ensure_ascii=False).encode("utf8"), text=True
-        )
-    except websockets.ConnectionClosedOK as e:
-        print(f"Something went wrong : {e}")
-        return False
-    start = time.perf_counter()
-    try:
-        async with asyncio.timeout(120):
-            wav_data = await tts_conn.recv(decode=False)
-    except websockets.ConnectionClosedOK as e:
-        print(f"Something went wrong : {e}")
-        return False
-    print(f"Task consumed {time.perf_counter() - start}s")
-
-    start = time.perf_counter()
-
-    resp = requests.put(
-        f'http://{config["stack_name"]}_{config["services"]["sound_service"]["docker_host"]}:{config["services"]["sound_service"]["port"]}/audio/{payload["token"]}',
-        wav_data,
-    )
-
-    print(
-        f"Sent to sound_service in {time.perf_counter()-start}s, and status_code {resp.status_code}"
-    )
-    if not resp.ok:
-        print(
-            "Something went wrong with sound_service, terminate process with 0 status so docker wont restart it"
-        )
         try:
-            await tts_conn.close()
-        except RuntimeError:
-            print("Exception catched while closing tts connection")
+            await tts_conn.send(
+                json.dumps(payload, ensure_ascii=False).encode("utf8"), text=True
+            )
+        except websockets.ConnectionClosed as e:
+            print(f"Something went wrong : {e}")
+            _return_announcement()
+            return True
+        start = time.perf_counter()
+        try:
+            async with asyncio.timeout(120):
+                wav_data = await tts_conn.recv(decode=False)
+        except websockets.ConnectionClosed as e:
+            print(f"Something went wrong : {e}")
+            _return_announcement()
+            return True
+        except TimeoutError as e:
+            print(f"TTS synthesis timed out : {e}")
+            _return_announcement()
+            return True
+        print(f"Task consumed {time.perf_counter() - start}s")
 
-        sys.exit(0)
+        start = time.perf_counter()
 
-    start = time.perf_counter()
-    out_ch_data[0].basic_publish(
-        exchange="",
-        routing_key=out_ch_data[1],
-        body=json.dumps({"uuid": payload["token"]}),
-        properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
-    )
+        try:
+            resp = requests.put(
+                f'http://{config["stack_name"]}_{config["services"]["sound_service"]["docker_host"]}:{config["services"]["sound_service"]["port"]}/audio/{payload["token"]}',
+                wav_data,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            # FIX: used to sys.exit(0) here — a "successful" exit from
+            # replicated-job's point of view, permanently burning one
+            # completion slot per sound_service hiccup. Now: log, close,
+            # nack, keep going.
+            print(f"Something went wrong with sound_service, keeping consumer alive : {e}")
+            try:
+                await tts_conn.close()
+            except RuntimeError:
+                print("Exception catched while closing tts connection")
+            _return_announcement()
+            return True
 
-    print(f"Sent to audio_awaiter in {time.perf_counter()-start}s")
+        print(
+            f"Sent to sound_service in {time.perf_counter()-start}s, and status_code {resp.status_code}"
+        )
 
-    print(
-        f"Done {int(payload['seq'])  + 1}/{payload['total']} and time passed : {datetime.now() - very_start_ts}"
-    )
+        start = time.perf_counter()
+        out_ch_data[0].basic_publish(
+            exchange="",
+            routing_key=out_ch_data[1],
+            body=json.dumps({"uuid": payload["token"]}),
+            properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
+        )
+
+        print(f"Sent to audio_awaiter in {time.perf_counter()-start}s")
+
+        # Only ack once the task genuinely completed.
+        tts_ch_data[0].basic_ack(delivery_tag=method_frame.delivery_tag)
+
+        print(
+            f"Done {int(payload['seq'])  + 1}/{payload['total']} and time passed : {datetime.now() - very_start_ts}"
+        )
+    except Exception:
+        # Any other unhandled failure: return the announcement instead of
+        # losing it silently, then let the process die loudly (non-zero
+        # exit, traceback) instead of the old bare sys.exit(0) pattern —
+        # visible as a crash, not a false "success".
+        _return_announcement()
+        raise
 
     print("Releasing tts connection...")
     try:
