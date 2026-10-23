@@ -69,9 +69,8 @@ async def callback(
         }
     }
     """
-    in_ch.basic_ack(delivery_tag=method.delivery_tag)
-
     if payload["accnum"] == "0" * 12:
+        in_ch.basic_ack(delivery_tag=method.delivery_tag)
         # assumed payload here contains only hostname
         # for tts which is expected to be dead soon
         out_ch_data[0].basic_publish(
@@ -111,6 +110,14 @@ async def callback(
 
     def _return_announcement():
         tts_ch_data[0].basic_nack(delivery_tag=method_frame.delivery_tag, requeue=True)
+        # The task itself used to be acked on arrival, so any failure below
+        # lost it for good. Now it is acked only on success; on failure it
+        # goes back to the queue once. A task that fails again on redelivery
+        # is dropped (likely a poison payload), so it can't spin forever —
+        # the reconciler (republish_tts.py --verify) re-publishes it later.
+        requeue = not method.redelivered
+        in_ch.basic_nack(delivery_tag=method.delivery_tag, requeue=requeue)
+        print(f"Task {payload['token']} returned to queue: {requeue}")
 
     tts_conn = await get_tts_conn(f"{config['stack_name']}_{tts_host}", tts_port)
     if tts_conn is None:
@@ -144,8 +151,12 @@ async def callback(
         start = time.perf_counter()
 
         try:
-            resp = requests.put(
-                f'http://{config["stack_name"]}_{config["services"]["sound_service"]["docker_host"]}:{config["services"]["sound_service"]["port"]}/audio/{payload["token"]}',
+            # docker_port (8080), not port (6667): the stack reaches
+            # sound_service over the overlay network, where 6667 (the
+            # ingress-published port) is not listened on. sound_service
+            # only accepts POST /audio/:uuid.
+            resp = requests.post(
+                f'http://{config["stack_name"]}_{config["services"]["sound_service"]["docker_host"]}:{config["services"]["sound_service"]["docker_port"]}/audio/{payload["token"]}',
                 wav_data,
             )
             resp.raise_for_status()
@@ -178,6 +189,7 @@ async def callback(
 
         # Only ack once the task genuinely completed.
         tts_ch_data[0].basic_ack(delivery_tag=method_frame.delivery_tag)
+        in_ch.basic_ack(delivery_tag=method.delivery_tag)
 
         print(
             f"Done {int(payload['seq'])  + 1}/{payload['total']} and time passed : {datetime.now() - very_start_ts}"
